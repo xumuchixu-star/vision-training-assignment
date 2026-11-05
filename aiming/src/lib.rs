@@ -40,14 +40,115 @@ pub fn aim(input: &Input, debug: &mut Gizmos) -> Option<Command> {
         debug.plate(plate, input.size, Color::Cyan);
     }
 
-    // 1. Find the observation age and account for launch latency.
-    // 2. Select an armor plate before solving its trajectory.
-    // 3. Solve a trajectory with Trajectory::solve.
-    // 4. Aim at the future plate position using age, launch delay, and flight time.
-    // Optional drawings for your solution:
-    // debug.plate(predicted_plate, input.size, Color::Green);
-    // debug.trajectory(trajectory, Color::Orange);
-    None
+    let age = input.now_s - observation.time_s;
+    let launch_delay = physics::LAUNCH_DELAY_S;
+    let latency = age + launch_delay;
+
+    let target = observation.target;
+    // 水平距离 / 弹速，先粗估飞行时间
+    let dx = target.x_m - physics::MUZZLE_M[0];
+    let dy = target.y_m - physics::MUZZLE_M[1];
+    let rough_flight_time = dx.hypot(dy) / physics::MUZZLE_SPEED_M_S;
+    let predicted_target = target.at(latency + rough_flight_time);
+    let plates = predicted_target.plates(input.size);
+    let mut selected = None;
+    let mut best_score = 0.0;
+    for (index, plate) in plates.iter().enumerate() {
+        // 从装甲板中心指向炮口的向量
+        let to_muzzle: [f64; 3] = std::array::from_fn(|i| physics::MUZZLE_M[i] - plate.center_m[i]);
+        let distance = to_muzzle.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if distance <= 0.0 {
+            continue;
+        }
+        // 两个方向越一致，评分越大，表示板面越正对炮口
+        let score = (0..3)
+            .map(|i| plate.outward_normal[i] * to_muzzle[i] / distance)
+            .sum::<f64>();
+
+        if score > best_score {
+            best_score = score;
+            selected = Some((index, *plate));
+        }
+    }
+    let (selected_index, selected_plate) = selected?;
+
+    let mut trajectory = Trajectory::solve(selected_plate.center_m)?;
+    let mut flight_time = trajectory.flight_time_s;
+    let mut converged = false;
+
+    for _ in 0..10 {
+        // 用当前飞行时间，重新预测同一块板
+        let target = observation.target.at(latency + flight_time);
+        let plate = target.plates(input.size)[selected_index];
+
+        // 重新求弹道
+        let new_trajectory = Trajectory::solve(plate.center_m)?;
+        let new_time = new_trajectory.flight_time_s;
+
+        let difference = (new_time - flight_time).abs();
+        trajectory = new_trajectory;
+        flight_time = new_time;
+
+        if difference < 0.0001 {
+            converged = true;
+            break;
+        }
+    }
+
+    if !converged {
+        return None;
+    }
+
+    // 用最终飞行时间重新计算命中时的板姿态和速度。
+    let predicted_plate = observation
+        .target
+        .at(latency + trajectory.flight_time_s)
+        .plates(input.size)[selected_index];
+    let projectile_velocity = trajectory.velocity(trajectory.flight_time_s);
+    let relative_velocity: [f64; 3] =
+        std::array::from_fn(|i| projectile_velocity[i] - predicted_plate.velocity_m_s[i]);
+    let relative_speed = relative_velocity.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if !relative_speed.is_finite() || relative_speed <= 0.0 {
+        return None;
+    }
+
+    // 外法线朝外，弹丸从正面射入时，相对速度与法线反向，所以取负号。
+    let incidence_score = -(0..3)
+        .map(|i| predicted_plate.outward_normal[i] * relative_velocity[i])
+        .sum::<f64>()
+        / relative_speed;
+    // 0.5 对应相对入射方向与向内法线夹角不超过 60°，可按效果调整。
+    const MIN_INCIDENCE_SCORE: f64 = 0.5;
+    let fire = incidence_score.is_finite() && incidence_score >= MIN_INCIDENCE_SCORE;
+
+    // 每一帧画观测板（青色）、预测板（可开火绿色，否则红色）和弹道。
+    let plate_color = if fire { Color::Green } else { Color::Red };
+    let impact_m = trajectory.position(trajectory.flight_time_s);
+    debug.plate(predicted_plate, input.size, plate_color);
+    debug.trajectory(trajectory, Color::Orange);
+    debug.point("Impact", impact_m, Color::Orange);
+    debug.point("Predicted plate", predicted_plate.center_m, plate_color);
+    // 紫色线段表示弹丸相对装甲板的入射方向，终点为预计弹道终点。
+    let approach_m =
+        std::array::from_fn(|i| impact_m[i] - 0.4 * relative_velocity[i] / relative_speed);
+    debug.line(approach_m, impact_m, Color::Purple);
+    debug.overlay("Plate index", selected_index);
+    debug.overlay("Observation age", format!("{:.1} ms", age * 1000.0));
+    debug.overlay(
+        "Flight",
+        format!("{:.1} ms", trajectory.flight_time_s * 1000.0),
+    );
+    debug.overlay(
+        "Incidence score",
+        format!("{incidence_score:.3} / min {MIN_INCIDENCE_SCORE:.2}"),
+    );
+    debug.overlay("Fire", if fire { "Yes" } else { "Hold: incidence angle" });
+
+    Some(Command {
+        yaw_rad: trajectory.yaw_rad,
+        pitch_rad: trajectory.pitch_rad,
+        fire,
+    })
 }
 
 /// The only simulation data provided to the applicant's controller.
